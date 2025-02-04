@@ -112,23 +112,19 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, args, device, epo
         )
         outputs_list = outputs_tuple[0]
         masks = outputs_list[0]['masks'].float()
-        # Calculate individual losses
+        
         reg_loss = (l2_regularisation(model.Probabilistic_model.prior) + 
                    l2_regularisation(model.Probabilistic_model.posterior))
-        
-        # Total loss
         loss = elbo(masks, labels, outputs_tuple[1], beta=args.beta) + args.reg_weight * reg_loss
         loss = loss.to(device)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         reconstruction_loss = elbo(masks, labels, outputs_tuple[1], beta=args.beta)  
-        # Accumulate losses
         total_loss += loss.item()
         total_reg_loss += reg_loss.item()
         total_rec_loss += reconstruction_loss.item()
         
-        # Log to tensorboard every N steps
         if batch_idx % 10 == 0:
             step = epoch * len(train_loader) + batch_idx
             writer.add_scalar('Train/BatchLoss', loss.item(), step)
@@ -138,12 +134,11 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, args, device, epo
         train_step += 1
         print(f"\rStep: {train_step}/{len(train_loader)}, Loss: {loss.item():.4f}", end='')
     
-    # Calculate average losses
     avg_loss = total_loss / len(train_loader)
     avg_reg_loss = total_reg_loss / len(train_loader)
     avg_rec_loss = total_rec_loss / len(train_loader)
     scheduler.step()
-    # Log epoch averages
+
     writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
     writer.add_scalar('Train/EpochRegLoss', avg_reg_loss, epoch)
     writer.add_scalar('Train/EpochReconLoss', avg_rec_loss, epoch)
@@ -186,7 +181,7 @@ def validate(model, val_loader, args, device, epoch, writer):
         dice_score = dice_metric(binary_masks, labels).to(device)
         total_dice += dice_score[0].item()
         
-        # Calculate IoU using provided function
+        # Calculate IoU 
         intersection = torch.logical_and(binary_masks.bool(), labels.bool())  
         union = torch.logical_or(binary_masks.bool(), labels.bool())      
         intersection_sum = intersection.sum(dim=(1, 2, 3))  
@@ -255,16 +250,12 @@ def validate_ged(model, val_loader, args, device, epoch, writer, num_samples=10)
 
 
 def main(args):
-    # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Setup output directories
     output_dirs = setup_output_dirs(args)
     exp_dir = output_dirs['exp_dir']
     ckpt_dir = output_dirs['ckpt_dir']
     log_dir = output_dirs['log_dir']
     
-    # Initialize tensorboard writer
     writer = SummaryWriter(log_dir=log_dir)
     
     print(f"\nExperiment directory: {exp_dir}")
