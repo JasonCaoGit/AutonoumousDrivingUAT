@@ -19,12 +19,14 @@ def get_args_parser():
                         help='directory name for checkpoints')
     parser.add_argument('--log_dir', default='logs', type=str,
                         help='directory name for tensorboard logs')
-    parser.add_argument('--dataset_path', default='./dataset/REFUGE-Multirater/REFUGE-Multirater', type=str,
+    parser.add_argument('--dataset_path', default='/local/scratch/v_jiaying_zhou/uncertainty_adapter/segment-anything-main/data/data_lidc-001.pickle', type=str,
                         help='dataset path')
     parser.add_argument('--checkpoint', default='./pretrain/sam_vit_b_01ec64.pth', type=str,
                         help='path to SAM checkpoint')
-    parser.add_argument('--resume', default=None, type=str,
+    parser.add_argument('--resume', default='./your_checkpoint', type=str,
                     help='path to checkpoint for validation')
+    parser.add_argument('--split_ratio', default=(0.8, 0.2), type=tuple,
+                        help='train-validation split ratio')
     
     # Model parameters
     parser.add_argument('--model_type', default='vit_b', type=str,

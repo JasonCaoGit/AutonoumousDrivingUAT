@@ -67,7 +67,7 @@ class REFUGE(Dataset):
             individual_cup_masks = [multi_rater_cup[i, :, :] for i in range(7)]  
 
             aggregated_cup_masks = []
-            for k in range(1, 8):  # 从1到7
+            for k in range(1, 8):  
                 selected_doctors = random.sample(range(7), k)
                 masks_k = multi_rater_cup[selected_doctors, :, :]  # [k, H, W]
                 aggregated_mask = self.majority_vote(masks_k)  # [H, W]

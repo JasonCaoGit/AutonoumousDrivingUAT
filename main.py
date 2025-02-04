@@ -12,7 +12,7 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 from dataset import build_dataset
 from config import get_args_parser, setup_output_dirs
-from utils import generate_click_prompt, random_box, l2_regularisation, elbo
+from utils import generate_click_prompt, random_box, l2_regularisation, elbo, iou, generalized_energy_distance
 import datetime
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -42,6 +42,8 @@ def get_scheduler(args, optimizer):
             eta_min=0
         )
     return scheduler
+
+
 
 def prepare_prompts(images, labels, args, devices):
     """
@@ -153,12 +155,8 @@ def validate(model, val_loader, args, device, epoch, writer):
     model.eval()
     total_dice = 0
     total_loss = 0
-    dice_metric = DiceMetric(
-        include_background=True,
-        reduction="mean",
-        get_not_nans=False,
-        ignore_empty=False
-    )
+    total_iou = 0
+    dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False, ignore_empty=False)
     
     for batch in val_loader:
         images = batch['image'].to(device)
@@ -172,38 +170,89 @@ def validate(model, val_loader, args, device, epoch, writer):
                 labels = batch['majorityvote_cup_label'].to(device)
             elif args.dataset == 'lidc':
                 labels = batch['majorityvote_label'].to(device)
-        batched_input = prepare_prompts(images, labels, args, device)
         
-        outputs_tuple = model(
-            batched_input=batched_input,
-            multimask_output=False
-        )
+        batched_input = prepare_prompts(images, labels, args, device)
+        outputs_tuple = model(batched_input=batched_input, multimask_output=False)
         outputs_list = outputs_tuple[0]
         masks = outputs_list[0]['masks'].float()
         
-        # Calculate validation loss
         loss = elbo(masks, labels, outputs_tuple[1], beta=args.beta)
         total_loss += loss.item()
         
         masks = torch.sigmoid(masks)
         binary_masks = (masks > 0.5).float()
+        
+        # Calculate Dice score
         dice_score = dice_metric(binary_masks, labels).to(device)
         total_dice += dice_score[0].item()
         
-        # Optional: Log sample predictions periodically
-        if writer is not None and epoch % 5 == 0:  # Every 5 epochs
-            writer.add_images('Val/Images', images[:4], epoch)  # Log first 4 images
+        # Calculate IoU using provided function
+        intersection = torch.logical_and(binary_masks.bool(), labels.bool())  
+        union = torch.logical_or(binary_masks.bool(), labels.bool())      
+        intersection_sum = intersection.sum(dim=(1, 2, 3))  
+        union_sum = union.sum(dim=(1, 2, 3))                
+        iou_per_image = (intersection_sum + 1e-8) / (union_sum + 1e-8) 
+        mean_iou_batch = iou_per_image.mean()
+        total_iou += mean_iou_batch.item()
+
+        
+        
+        if writer is not None and epoch % 5 == 0:
+            writer.add_images('Val/Images', images[:4], epoch)
             writer.add_images('Val/TrueMasks', labels[:4], epoch)
             writer.add_images('Val/PredMasks', binary_masks[:4], epoch)
     
     avg_dice = total_dice / len(val_loader)
     avg_loss = total_loss / len(val_loader)
+    avg_iou = total_iou / len(val_loader)
+    
     
     if writer is not None:
         writer.add_scalar('Val/DiceScore', avg_dice, epoch)
         writer.add_scalar('Val/Loss', avg_loss, epoch)
+        writer.add_scalar('Val/IoU', avg_iou, epoch)
+        
     
-    return avg_loss, avg_dice
+    return avg_loss, avg_dice, avg_iou
+
+@torch.no_grad()
+def validate_ged(model, val_loader, args, device, epoch, writer, num_samples=10):
+    model.eval()
+    total_ged = 0
+    
+    for batch_idx, batch in enumerate(val_loader):
+        images = batch['image'].to(device)         
+        all_masks = batch['all_masks'].to(device) 
+
+        batch_predictions_list = []
+        for _ in range(num_samples):
+            if args.dataset == 'refuge':
+                labels = batch['majorityvote_cup_label'].to(device) 
+            elif args.dataset == 'lidc':
+                labels = batch['majorityvote_label'].to(device)     
+
+            batched_input = prepare_prompts(images, labels, args, device)
+            outputs_tuple = model(batched_input=batched_input, multimask_output=False)
+            masks = torch.sigmoid(outputs_tuple[0][0]['masks'])
+            batch_predictions_list.append(masks)  # shape: (B,1,H,W)
+
+        # (num_samples, B, 1, H, W)
+        preds_stacked = torch.stack(batch_predictions_list, dim=0)
+        preds_stacked = preds_stacked.permute(1, 0, 2, 3, 4).squeeze(2)
+        batch_ged = generalized_energy_distance(
+            labels=all_masks,
+            preds=preds_stacked,
+            thresh=0.5,
+            num_classes=2
+        )
+        total_ged += batch_ged
+    avg_ged = total_ged / len(val_loader)
+    
+    if writer is not None:
+        writer.add_scalar('Val/GED_Samples', avg_ged, epoch)
+    
+    return avg_ged
+
 
 def main(args):
     # Setup device
@@ -243,22 +292,39 @@ def main(args):
     if args.mode == 'train':
         if args.dataset == 'refuge':
             train_dataset = ConcatDataset([train_dataset, val_dataset])
-        elif args.dataset == 'lidc':
-            train_dataset = train_dataset
-        train_loader = DataLoader(
+            train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             shuffle=True,
             pin_memory=args.pin_memory
-        )
-        test_loader = DataLoader(
-            test_dataset,
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=False,
+                pin_memory=args.pin_memory
+            )
+        elif args.dataset == 'lidc':
+            train_dataset = train_dataset
+            train_loader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            shuffle=False,
+            shuffle=True,
+            drop_last=True,
             pin_memory=args.pin_memory
-        )
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=False,
+                drop_last=True,
+                pin_memory=args.pin_memory
+            )
+        
         
         # Build model
         model = sam_model_registry[args.model_type](checkpoint=args.checkpoint, args=args)
@@ -291,7 +357,7 @@ def main(args):
             train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, args, device, epoch, writer)
             
             # Validate
-            val_loss, _ = validate(model, test_loader, args, device, epoch, writer)
+            val_loss, _, _ = validate(model, test_loader, args, device, epoch, writer)
             
             # Log learning rate
             writer.add_scalar('Train/LearningRate', scheduler.get_last_lr()[0], epoch)
@@ -331,14 +397,24 @@ def main(args):
                     break
         writer.close()
             
-    else:  # Validation mode
-        test_loader = DataLoader(
+    else: 
+        if args.dataset == 'refuge':
+            test_loader = DataLoader(
             test_dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             shuffle=False,
             pin_memory=args.pin_memory
-        )
+            )
+        elif args.dataset == 'lidc':    
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=False,
+                drop_last=True,
+                pin_memory=args.pin_memory
+            )
         
         # Load model
         model = sam_model_registry[args.model_type](checkpoint=args.checkpoint, args=args)
@@ -346,19 +422,36 @@ def main(args):
             checkpoint = torch.load(args.resume)
             model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded checkpoint from: {args.resume}")
+        # checkpoint = '/UA-SAM/LIDC_UA-SAM_prompt.pth'
+        # model = sam_model_registry[args.model_type](checkpoint=checkpoint, args=args)
         model = model.to(device)
         model.eval()
         # Run validation
         final_dice = 0
+        final_iou = 0
+        final_ged = 0
         num_runs = 10
         print("Running validation...")
         for i in range(num_runs):
-            _, val_dice = validate(model, test_loader, args, device, i, None)  # No writer needed for validation
-            print(f"Run {i+1}/{num_runs} - Dice Score: {val_dice:.4f}")
+            _, val_dice, val_iou = validate(model, test_loader, args, device, i, writer)
+            val_ged = validate_ged(model, test_loader, args, device, i, writer, num_samples=16)
+            print(f"Run {i+1}/{num_runs}")
+            print(f"  - Dice Score: {val_dice:.4f}")
+            print(f"  - IoU Score: {val_iou:.4f}")
+            print(f"  - GED Score: {val_ged:.4f}")
             final_dice += val_dice
+            final_iou += val_iou
+            final_ged += val_ged
         
+        # Calculate final averages
         final_dice = final_dice / num_runs
-        print(f"\nFinal Average Dice Score: {final_dice:.4f}")
+        final_iou = final_iou / num_runs
+        final_ged = final_ged / num_runs
+        
+        print("\nFinal Results:")
+        print(f"Average Dice Score: {final_dice:.4f}")
+        print(f"Average IoU Score: {final_iou:.4f}")
+        print(f"Average GED Score: {final_ged:.4f}")
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()

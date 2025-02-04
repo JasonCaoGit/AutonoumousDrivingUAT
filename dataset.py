@@ -90,6 +90,7 @@ class REFUGE(Dataset):
         return {
             'image': img,
             'random_cup_label': random_cup_label,
+            'all_masks': multi_rater_cup,
             'random_disc_label': random_disc_label,
             'majorityvote_cup_label': majorityvote_cup_label,
             'majorityvote_disc_label': majorityvote_disc_label,
@@ -177,11 +178,16 @@ class LIDC_IDRI(Dataset):
             'image': image,
             'majorityvote_label': label,
             'random_label': random.choice(masks),
-            'multi_rater': torch.stack(masks),
+            'all_masks': torch.stack(masks),
         }
 
     def __len__(self):
         return len(self.data)
+    
+    def get_train_val_test(self):
+        train_dataset = Subset(self, self.train_indices)
+        val_dataset = Subset(self, self.val_indices)
+        return train_dataset, val_dataset
 
 def build_dataset(args):
     transform_refuge = transforms.Compose([
@@ -199,8 +205,7 @@ def build_dataset(args):
     elif args.dataset == 'lidc':
         full_dataset = LIDC_IDRI(args.dataset_path, transform=transform_lidc, 
                                 split_ratio=args.split_ratio)
-        train_dataset = Subset(full_dataset, full_dataset.train_indices)
-        val_dataset = Subset(full_dataset, full_dataset.val_indices)
+        train_dataset, val_dataset = full_dataset.get_train_val_test()
         test_dataset = val_dataset  
     
     else:

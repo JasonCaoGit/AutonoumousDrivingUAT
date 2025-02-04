@@ -62,40 +62,31 @@ def random_box(mask, box_num=1, std=0.1, max_pixel=5):
     noise_boxes = []
 
     for i in range(B):
-        single_mask = mask[i, 0, :, :].cpu().numpy()  # 将张量从GPU移到CPU并转换为numpy数组
+        single_mask = mask[i, 0, :, :].cpu().numpy()  
 
         label_img = label(single_mask)
         regions = regionprops(label_img)
 
-        # Iterate through all regions and get the bounding box coordinates
         boxes = [tuple(region.bbox) for region in regions]
 
-        # 如果 boxes 为空，跳过这个样本或返回默认的 box
         if len(boxes) == 0:
             noise_boxes.append([(0, 0, 0, 0) for _ in range(box_num)])
             continue
 
-        # If the generated number of boxes is greater than the number of categories,
-        # sort them by region area and select the top n regions
         if len(boxes) >= box_num:
             sorted_regions = sorted(regions, key=lambda x: x.area, reverse=True)[:box_num]
             boxes = [tuple(region.bbox) for region in sorted_regions]
 
-        # If the generated number of boxes is less than the number of categories,
-        # duplicate the existing boxes
         elif len(boxes) < box_num:
             num_duplicates = box_num - len(boxes)
             boxes += [boxes[i % len(boxes)] for i in range(num_duplicates)]
 
-        # Perturb each bounding box with noise
         batch_noise_boxes = []
         for box in boxes:
             y0, x0, y1, x1 = box
             width, height = abs(x1 - x0), abs(y1 - y0)
-            # Calculate the standard deviation and maximum noise value
             noise_std = min(width, height) * std
-            max_noise = max(1, min(max_pixel, int(noise_std * 5)))  # 确保 max_noise 至少为1
-            # Add random noise to each coordinate
+            max_noise = max(1, min(max_pixel, int(noise_std * 5)))  
             noise_x = np.random.randint(-max_noise, max_noise)
             noise_y = np.random.randint(-max_noise, max_noise)
             x0, y0 = x0 + noise_x, y0 + noise_y
@@ -226,3 +217,68 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def iou(x, y, axis=-1):
+    smooth = 1e-8
+    iou_ = ((x & y).sum(axis)) / ((x | y).sum(axis) + smooth)
+    iou_[np.isnan(iou_)] = 1.0
+    return iou_
+
+# exclude background
+def distance(x, y):
+    try:
+        # x[:, None] -> (M,1,H*W,2)
+        # y[None, :] -> (1,N,H*W,2)
+        per_class_iou = iou(x[:, None], y[None, :], axis=-2)
+    except MemoryError:
+        per_class_iou = []
+        for x_ in x:
+            x_ = np.expand_dims(x_, axis=0)  # (1,H*W,2)
+            per_class_iou.append(iou(x_, y[None, :], axis=-2))
+        per_class_iou = np.concatenate(per_class_iou)
+    return 1.0 - per_class_iou[..., 1:].mean(-1)
+
+def calc_generalised_energy_distance(dist_0, dist_1, num_classes=2):
+    """
+    dist_0: shape (M, H, W)
+    dist_1: shape (N, H, W)
+    """
+    #  (M, H, W) -> (M, H*W)
+    dist_0 = dist_0.reshape((len(dist_0), -1))
+    dist_1 = dist_1.reshape((len(dist_1), -1))
+
+    dist_0 = dist_0.cpu().numpy().astype("int")
+    dist_1 = dist_1.cpu().numpy().astype("int")
+
+    eye = np.eye(num_classes)
+    dist_0 = eye[dist_0].astype('bool')
+    dist_1 = eye[dist_1].astype('bool')
+
+    cross_distance = np.mean(distance(dist_0, dist_1))
+    distance_0 = np.mean(distance(dist_0, dist_0))
+    distance_1 = np.mean(distance(dist_1, dist_1))
+    
+    return cross_distance, distance_0, distance_1
+
+def generalized_energy_distance(labels, preds, thresh=0.5, num_classes=2):
+    """
+    - labels: shape (B, M, H, W)
+    - preds:  shape (B, N, H, W)
+    """
+    batch_ged = []
+    
+    bin_preds = (preds > thresh).float()
+    
+    B = labels.shape[0]
+    for i in range(B):
+        dist_0 = labels[i]  # shape (M,H,W)
+        dist_1 = bin_preds[i]  # shape (N,H,W)
+        cross, d_0, d_1 = calc_generalised_energy_distance(dist_0, dist_1, num_classes=num_classes)
+        
+        # GED = 2 * E[cross] - E[dist_0] - E[dist_1]
+        ged_i = 2.0 * cross - d_0 - d_1
+        batch_ged.append(ged_i)
+    
+    return float(np.mean(batch_ged))
+	
