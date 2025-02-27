@@ -5,11 +5,25 @@ import random
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 import numpy as np
+import imgaug.augmenters as iaa
+import albumentations as A
 
-# ----- (Optional) Elastic Deformation Function -----
-# (Not used for raw images in this script)
+# Fix numpy deprecated types
+np.complex = np.complex_
+np.bool = bool
+
+# ----- Weather Effect Functions -----
+def generate_rain_image(image):
+    """Applies a moderate rain effect using imgaug."""
+    aug = iaa.Rain(
+        drop_size=(0.1, 0.15),  # Smaller drops
+        speed=(0.1, 0.3)  # Slower rain
+    )
+    return aug.augment_image(image)
+
+# ----- Elastic Deformation Function -----
 def elastic_deformation(image, alpha=1.0, sigma=8.0):
-    """Apply elastic deformation to an image (if needed). Not used here for raw images."""
+    """Apply elastic deformation to an image."""
     shape = image.shape
     dx = gaussian_filter((np.random.rand(*shape[:2]) * 2 - 1), sigma) * alpha
     dy = gaussian_filter((np.random.rand(*shape[:2]) * 2 - 1), sigma) * alpha
@@ -22,23 +36,12 @@ def elastic_deformation(image, alpha=1.0, sigma=8.0):
         deformed = cv2.remap(image, x_map, y_map, interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT_101)
     return deformed, (x_map, y_map)
 
-# ----- Boundary Noise Function -----
-def add_boundary_noise(mask, noise_probability=0.05, noise_radius=3):
-    """Add noise to the boundaries of a binary mask."""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    noisy_mask = mask.copy()
-    for contour in contours:
-        for point in contour:
-            x, y = point[0]
-            y_min = max(0, y - noise_radius)
-            y_max = min(mask.shape[0], y + noise_radius + 1)
-            x_min = max(0, x - noise_radius)
-            x_max = min(mask.shape[1], x + noise_radius + 1)
-            for i in range(y_min, y_max):
-                for j in range(x_min, x_max):
-                    if random.random() < noise_probability:
-                        noisy_mask[i, j] = 255 - noisy_mask[i, j]
-    return noisy_mask
+# ----- Weather-inspired deformation parameters -----
+deformation_params = [
+    {"alpha": 20.0, "sigma": 15.0},  # Fog-like: higher sigma for smoother, blurred boundaries
+    {"alpha": 25.0, "sigma": 4.0},  # Rain-like: sharper, more localized changes
+    {"alpha": 30.0, "sigma": 7.0}  # Snow-like: medium smoothness with stronger distortion
+]
 
 # ----- Load Class Dictionary and Filter Target Classes -----
 target_classes = {"bus", "pedestrian", "car"}
@@ -55,18 +58,13 @@ with open('class_dict.csv', 'r') as file:
 print(f"Found {len(rgb_dict)} target classes: {list(rgb_dict.keys())}")
 
 # ----- Set Input and Output Directories -----
-raw_img_dir = "train"            # Folder containing raw images
-gt_mask_dir = "train_labels"       # Folder containing ground truth masks (filenames: <base>_L.png)
+raw_img_dir = "train"  # Folder containing raw images
+gt_mask_dir = "train_labels"  # Folder containing ground truth masks (filenames: <base>_L.png)
 output_root = "processed_dataset"  # Root folder for processed outputs
 if not os.path.exists(output_root):
     os.makedirs(output_root)
 
-# ----- Configure Noise Parameters -----
-noise_probability = 0.05  # Boundary noise probability
-noise_radius = 3          # Noise radius
-
 # ----- Process Each Raw Image -----
-# For each raw image in "train", there is a corresponding mask in "train_labels" named as <base>_L.png.
 raw_files = [f for f in os.listdir(raw_img_dir) if f.endswith('.png')]
 total_files = len(raw_files)
 print(f"\nProcessing {total_files} images...")
@@ -107,30 +105,48 @@ for file_name in tqdm(raw_files, desc="Processing images"):
                 continue
 
             # Crop the raw image and the binary mask to the bounding box
-            cropped_raw = raw_img[y:y+h, x:x+w]
-            cropped_mask = binary_mask[y:y+h, x:x+w]
+            cropped_raw = raw_img[y:y + h, x:x + w]
+            cropped_mask = binary_mask[y:y + h, x:x + w]
 
-            # Create an output folder for this instance.
-            # Folder name format: "<class_name>_<base_name>_<instance_counter>"
+            # Create an output folder for this instance
             instance_folder = os.path.join(output_root, f"{class_name}_{base_name}_{instance_counter}")
             if not os.path.exists(instance_folder):
                 os.makedirs(instance_folder)
 
-            # Save the cropped raw image with original naming: e.g., "car_1.png"
-            cropped_raw_filename = f"{class_name}_{base_name}_{instance_counter}.png"
-            cropped_raw_path = os.path.join(instance_folder, cropped_raw_filename)
-            cv2.imwrite(cropped_raw_path, cropped_raw)
+            # Apply rain effect to the cropped raw image
+            # Convert BGR to RGB for imgaug
+            cropped_raw_rgb = cv2.cvtColor(cropped_raw, cv2.COLOR_BGR2RGB)
+
+            # Process for rain effect
+            rain_img = generate_rain_image(cropped_raw_rgb.copy())
+
+            # Convert back to BGR for saving
+            rain_img_bgr = cv2.cvtColor(rain_img, cv2.COLOR_RGB2BGR)
+
+            # Save the rain-affected image with the original naming
+            orig_img_filename = f"{class_name}_{base_name}_{instance_counter}.png"
+            orig_img_path = os.path.join(instance_folder, orig_img_filename)
+            cv2.imwrite(orig_img_path, rain_img_bgr)
 
             # Save the cropped original binary mask as e.g., "car_1_seg_1.png"
             orig_mask_filename = f"{class_name}_{base_name}_{instance_counter}_seg_1.png"
             orig_mask_path = os.path.join(instance_folder, orig_mask_filename)
             cv2.imwrite(orig_mask_path, cropped_mask)
 
-            # Create a noisy version of the cropped binary mask
-            noisy_mask = add_boundary_noise(cropped_mask, noise_probability, noise_radius)
-            noisy_mask_filename = f"{class_name}_{base_name}_{instance_counter}_seg_2.png"
-            noisy_mask_path = os.path.join(instance_folder, noisy_mask_filename)
-            cv2.imwrite(noisy_mask_path, noisy_mask)
+            # Generate three different deformed versions of the mask
+            for i, params in enumerate(deformation_params, start=2):
+                # Apply elastic deformation with parameters matching weather effects
+                deformed_mask, _ = elastic_deformation(cropped_mask,
+                                                       alpha=params["alpha"],
+                                                       sigma=params["sigma"])
+
+                # Ensure the deformed mask stays binary
+                deformed_mask = (deformed_mask > 127).astype(np.uint8) * 255
+
+                # Save the deformed mask
+                deformed_mask_filename = f"{class_name}_{base_name}_{instance_counter}_seg_{i}.png"
+                deformed_mask_path = os.path.join(instance_folder, deformed_mask_filename)
+                cv2.imwrite(deformed_mask_path, deformed_mask)
 
             instance_counter += 1
 
