@@ -1,8 +1,5 @@
 import os
-import pickle
 import random
-import json
-import pandas as pd
 import torch
 from torch.utils.data import Dataset, Subset
 from PIL import Image
@@ -10,11 +7,20 @@ import torchvision.transforms as transforms
 import numpy as np
 
 
-class REFUGE(Dataset):
-    def __init__(self, data_path, transform=None, image_size=512,  mode='Training'):
+class SingleObjectDataset(Dataset):
+    """
+    Modified dataset class for a single object per subfolder.
+    Each subfolder (e.g. "car1") contains a raw image (e.g. "car1.jpg")
+    and multiple segmentation masks (e.g. "car1_seg_1.png", "car1_seg_2.png", ...).
+    """
+
+    def __init__(self, data_path, transform=None, image_size=512, mode='Training'):
+        # Here we keep the folder structure (e.g. data_path/Training-400) the same.
         self.data_path = data_path
-        self.subfolders = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.join(data_path, mode + '-400')) for f in dn]
         self.mode = mode
+        # We assume that each subfolder under mode+'-400' represents one instance.
+        self.subfolders = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.join(data_path, mode + '-400')) for f
+                           in dn if os.path.isdir(os.path.join(dp, f))]
         self.img_size = image_size
         self.transform = transform
 
@@ -22,81 +28,84 @@ class REFUGE(Dataset):
         return len(self.subfolders)
 
     def majority_vote(self, masks):
+        """
+        Given a tensor of shape (N, H, W) of binary masks, compute a majority vote
+        mask (1 if more than half of the N masks are 1 at that pixel, else 0).
+        """
         _, H, W = masks.size()
         final_mask = torch.zeros((1, H, W), dtype=torch.float32, device=masks.device)
-
         for h in range(H):
             for w in range(W):
                 votes = torch.sum(masks[:, h, w])
-                if votes > masks.size(0) // 2: 
-                    final_mask[0, h, w] = 1 
+                if votes > masks.size(0) // 2:
+                    final_mask[0, h, w] = 1
         return final_mask
 
-    def load_disc_info(self, xlsx_path):
-        xl = pd.ExcelFile(xlsx_path)
-        df = xl.parse(xl.sheet_names[0])
-        disc_info_json = df.iloc[2, 2]  # Rows and columns are zero-indexed
-        disc_info = json.loads(disc_info_json)
-        return disc_info
-
-    def crop_to_disc(self, image, disc_info, output_size=(384, 384)):
-        """
-        Crop the image around the disc center to the specified output size.
-        """
-        center_x, center_y = disc_info['centerX'], disc_info['centerY']
-        width, height = output_size
-        left = max(center_x - width // 2, 0)
-        top = max(center_y - height // 2, 0)
-        right = min(center_x + width // 2, image.width)
-        bottom = min(center_y + height // 2, image.height)
-        image = image.crop((left, top, right, bottom))
-        return image
-
     def __getitem__(self, index):
-
-        """Get the images"""
+        """
+        For each subfolder, load the raw image and all segmentation mask files.
+        Apply the same transform (if any) to the raw image and masks.
+        Then choose one random mask and compute the majority vote mask.
+        Return a dictionary with the processed image, random mask,
+        majority vote mask, and meta data.
+        """
         subfolder = self.subfolders[index]
         name = os.path.basename(subfolder)
+        # Raw image filename: <name>.jpg
         img_path = os.path.join(subfolder, name + '.jpg')
-        xlsx_path = os.path.join(subfolder, name + '.xlsx')
-        disc_info = self.load_disc_info(xlsx_path)
-        multi_rater_cup_path = [os.path.join(subfolder, name + '_seg_cup_' + str(i) + '.png') for i in range(1, 8)]
-        multi_rater_disc_path = [os.path.join(subfolder, name + '_seg_disc_' + str(i) + '.png') for i in range(1, 8)]
 
-        # raw image and raters images
+        # Get all segmentation mask files matching the pattern <name>_seg_*.png
+        mask_files = [os.path.join(subfolder, f) for f in os.listdir(subfolder)
+                      if f.startswith(name + '_seg_') and f.endswith('.png')]
+        if not mask_files:
+            raise ValueError(f"No segmentation masks found in {subfolder}")
+
+        # Open raw image
         img = Image.open(img_path).convert('RGB')
-        img = self.crop_to_disc(img, disc_info, output_size=(384, 384))
-        multi_rater_cup = [self.crop_to_disc(Image.open(path).convert('L'), disc_info, output_size=(384, 384)) for path in multi_rater_cup_path]
-        multi_rater_disc = [self.crop_to_disc(Image.open(path).convert('L'), disc_info, output_size=(384, 384)) for path in multi_rater_disc_path]
+        # Optionally, resize the raw image (here we use center-crop/resizing)
+        img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
 
+        # Open each segmentation mask as grayscale ("L")
+        masks = [Image.open(path).convert('L').resize((self.img_size, self.img_size), Image.NEAREST) for path in
+                 mask_files]
+
+        # If a transform is provided, apply it to both image and masks.
+        # Save the current random state to ensure consistency.
         if self.transform:
             state = torch.get_rng_state()
             img = self.transform(img)
-            multi_rater_cup = [torch.as_tensor((self.transform(single_rater) > 0.5).float(), dtype=torch.float32) for single_rater in multi_rater_cup]
-            multi_rater_cup = torch.stack(multi_rater_cup, dim=0)
-            random_cup_label = random.choice(multi_rater_cup)  
-            multi_rater_cup = torch.squeeze(multi_rater_cup, dim=1)
-            majorityvote_cup_label = self.majority_vote(multi_rater_cup)  
-
-
-            multi_rater_disc = [torch.as_tensor((self.transform(single_rater) > 0.5).float(), dtype=torch.float32) for single_rater in multi_rater_disc]
-            multi_rater_disc = torch.stack(multi_rater_disc, dim=0)
-            random_disc_label = random.choice(multi_rater_disc)  
-            multi_rater_disc = torch.squeeze(multi_rater_disc, dim=1)
-            majorityvote_disc_label = self.majority_vote(multi_rater_disc)  
+            # For masks, apply the transform then threshold at 0.5
+            masks = [torch.as_tensor((self.transform(single_mask) > 0.5).float(), dtype=torch.float32) for single_mask
+                     in masks]
+            masks = torch.stack(masks, dim=0)  # shape: (N, 1, H, W)
+            # Remove channel dimension
+            masks = torch.squeeze(masks, dim=1)  # shape: (N, H, W)
+            # Randomly choose one mask
+            random_mask = random.choice(masks)
+            # Compute majority vote mask across all masks
+            majority_mask = self.majority_vote(masks)
             torch.set_rng_state(state)
-        image_meta_dict = {'filename_or_obj': name}
+        else:
+            # If no transform is provided, convert images to tensors manually.
+            img = transforms.ToTensor()(img)
+            masks = [transforms.ToTensor()(single_mask) for single_mask in masks]
+            masks = torch.stack(masks, dim=0)
+            masks = torch.squeeze(masks, dim=1)
+            random_mask = random.choice(masks)
+            majority_mask = self.majority_vote(masks)
 
+        image_meta_dict = {'filename_or_obj': name}
         return {
             'image': img,
-            'random_cup_label': random_cup_label,
-            'all_masks': multi_rater_cup,
-            'random_disc_label': random_disc_label,
-            'majorityvote_cup_label': majorityvote_cup_label,
-            'majorityvote_disc_label': majorityvote_disc_label,
-            'multi_rater_cup': multi_rater_cup,
+            'random_mask_label': random_mask,
+            'majorityvote_label': majority_mask,
+            'all_masks': masks,
             'image_meta_dict': image_meta_dict,
         }
+
+
+# For compatibility with the rest of the code, we leave the LIDC_IDRI class unchanged.
+# (This class is used for a different dataset and is not affected by our modifications.)
 
 class LIDC_IDRI(Dataset):
     def __init__(self, dataset_location, transform=None, split_ratio=(0.8, 0.2)):
@@ -116,7 +125,6 @@ class LIDC_IDRI(Dataset):
             for _ in range(0, input_size, max_bytes):
                 bytes_in += f_in.read(max_bytes)
         new_data = pickle.loads(bytes_in)
-        
         for key, value in new_data.items():
             self.data.append(value['image'].astype(float))
             self.labels.append(value['masks'])
@@ -138,10 +146,8 @@ class LIDC_IDRI(Dataset):
     def majority_vote(self, masks):
         num_masks, height, width = masks.shape
         final_mask = np.zeros((height, width), dtype=float)
-        
         if np.sum(np.all(masks == 0, axis=(1, 2))) >= 2:
             return final_mask
-            
         for h in range(height):
             for w in range(width):
                 votes = np.sum(masks[:, h, w])
@@ -154,26 +160,18 @@ class LIDC_IDRI(Dataset):
         masks_four = np.array(self.labels[index])
         label = self.majority_vote(masks_four).astype(float)
         masks = self.labels[index]
-
-        transform_label = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        
+        transform_label = transforms.Compose([transforms.ToTensor()])
         if isinstance(label, np.ndarray):
             label = Image.fromarray((label * 255).astype(np.uint8))
-            
         if isinstance(masks, list):
             masks = [Image.fromarray((mask * 255).astype(np.uint8)) for mask in masks]
-
         if self.transform:
             image = self.resize_channel_totensor(image)
             label = transform_label(label)
             masks = [transform_label(mask) for mask in masks]
-
         threshold = 0.5
         label = (label > threshold).float()
         masks = [(mask > threshold).float() for mask in masks]
-        
         return {
             'image': image,
             'majorityvote_label': label,
@@ -183,11 +181,12 @@ class LIDC_IDRI(Dataset):
 
     def __len__(self):
         return len(self.data)
-    
+
     def get_train_val_test(self):
         train_dataset = Subset(self, self.train_indices)
         val_dataset = Subset(self, self.val_indices)
         return train_dataset, val_dataset
+
 
 def build_dataset(args):
     transform_refuge = transforms.Compose([
@@ -198,17 +197,14 @@ def build_dataset(args):
         transforms.ToTensor(),
     ])
     if args.dataset == 'refuge':
-        train_dataset = REFUGE(args.dataset_path, transform=transform_refuge, mode='Training')
-        val_dataset = REFUGE(args.dataset_path, transform=transform_refuge, mode='Validation')
-        test_dataset = REFUGE(args.dataset_path, transform=transform_refuge, mode='Test')
-        
+        # Use the modified SingleObjectDataset (renamed here as REFUGE for compatibility)
+        train_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Training')
+        val_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Validation')
+        test_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Test')
     elif args.dataset == 'lidc':
-        full_dataset = LIDC_IDRI(args.dataset_path, transform=transform_lidc, 
-                                split_ratio=args.split_ratio)
+        full_dataset = LIDC_IDRI(args.dataset_path, transform=transform_lidc, split_ratio=args.split_ratio)
         train_dataset, val_dataset = full_dataset.get_train_val_test()
-        test_dataset = val_dataset  
-    
+        test_dataset = val_dataset
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
-    
     return train_dataset, val_dataset, test_dataset

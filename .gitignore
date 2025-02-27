@@ -2,3 +2,6 @@ __pycache__/
 venv/
 .idea/
 *.env
+dataset/
+pretrain/
+segment_anything
