@@ -6,21 +6,19 @@ from PIL import Image
 import torchvision.transforms as transforms
 import numpy as np
 
-
 class SingleObjectDataset(Dataset):
     """
     Modified dataset class for a single object per subfolder.
-    Each subfolder (e.g. "car1") contains a raw image (e.g. "car1.jpg")
-    and multiple segmentation masks (e.g. "car1_seg_1.png", "car1_seg_2.png", ...).
+    Each subfolder (e.g. "car_1") contains a raw image (e.g. "car_1.png")
+    and multiple segmentation masks (e.g. "car_1_seg_1.png", "car_1_seg_2.png", ...).
     """
-
     def __init__(self, data_path, transform=None, image_size=512, mode='Training'):
-        # Here we keep the folder structure (e.g. data_path/Training-400) the same.
+        # Keep the same folder structure: data_path/Training-400, etc.
         self.data_path = data_path
         self.mode = mode
-        # We assume that each subfolder under mode+'-400' represents one instance.
-        self.subfolders = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.join(data_path, mode + '-400')) for f
-                           in dn if os.path.isdir(os.path.join(dp, f))]
+        # Each subfolder under mode+'-400' represents one instance.
+        self.subfolders = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.join(data_path, mode + '-400'))
+                           for f in dn if os.path.isdir(os.path.join(dp, f))]
         self.img_size = image_size
         self.transform = transform
 
@@ -29,8 +27,8 @@ class SingleObjectDataset(Dataset):
 
     def majority_vote(self, masks):
         """
-        Given a tensor of shape (N, H, W) of binary masks, compute a majority vote
-        mask (1 if more than half of the N masks are 1 at that pixel, else 0).
+        Given a tensor of shape (N, H, W) of binary masks,
+        compute the majority vote mask.
         """
         _, H, W = masks.size()
         final_mask = torch.zeros((1, H, W), dtype=torch.float32, device=masks.device)
@@ -44,54 +42,50 @@ class SingleObjectDataset(Dataset):
     def __getitem__(self, index):
         """
         For each subfolder, load the raw image and all segmentation mask files.
-        Apply the same transform (if any) to the raw image and masks.
         Then choose one random mask and compute the majority vote mask.
         Return a dictionary with the processed image, random mask,
         majority vote mask, and meta data.
         """
         subfolder = self.subfolders[index]
         name = os.path.basename(subfolder)
-        # Raw image filename: <name>.jpg
-        img_path = os.path.join(subfolder, name + '.jpg')
-
+        # Raw image filename: <name>.png (assume raw images are PNG)
+        img_path = os.path.join(subfolder, name + '.png')
         # Get all segmentation mask files matching the pattern <name>_seg_*.png
         mask_files = [os.path.join(subfolder, f) for f in os.listdir(subfolder)
                       if f.startswith(name + '_seg_') and f.endswith('.png')]
         if not mask_files:
             raise ValueError(f"No segmentation masks found in {subfolder}")
 
-        # Open raw image
+        # Open raw image and resize (using bilinear interpolation)
         img = Image.open(img_path).convert('RGB')
-        # Optionally, resize the raw image (here we use center-crop/resizing)
         img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
 
-        # Open each segmentation mask as grayscale ("L")
-        masks = [Image.open(path).convert('L').resize((self.img_size, self.img_size), Image.NEAREST) for path in
-                 mask_files]
+        # Open each segmentation mask as grayscale ("L") and resize (using nearest)
+        masks = [Image.open(path).convert('L').resize((self.img_size, self.img_size), Image.NEAREST)
+                 for path in mask_files]
 
-        # If a transform is provided, apply it to both image and masks.
-        # Save the current random state to ensure consistency.
         if self.transform:
             state = torch.get_rng_state()
             img = self.transform(img)
-            # For masks, apply the transform then threshold at 0.5
-            masks = [torch.as_tensor((self.transform(single_mask) > 0.5).float(), dtype=torch.float32) for single_mask
-                     in masks]
+            # Apply the transform to each mask then threshold (result is 1 channel)
+            masks = [torch.as_tensor((self.transform(single_mask) > 0.5).float(), dtype=torch.float32)
+                     for single_mask in masks]
             masks = torch.stack(masks, dim=0)  # shape: (N, 1, H, W)
-            # Remove channel dimension
             masks = torch.squeeze(masks, dim=1)  # shape: (N, H, W)
-            # Randomly choose one mask
             random_mask = random.choice(masks)
-            # Compute majority vote mask across all masks
+            # Ensure the random mask has a channel dimension so its shape is (1, H, W)
+            if random_mask.ndim == 2:
+                random_mask = random_mask.unsqueeze(0)
             majority_mask = self.majority_vote(masks)
             torch.set_rng_state(state)
         else:
-            # If no transform is provided, convert images to tensors manually.
             img = transforms.ToTensor()(img)
             masks = [transforms.ToTensor()(single_mask) for single_mask in masks]
             masks = torch.stack(masks, dim=0)
             masks = torch.squeeze(masks, dim=1)
             random_mask = random.choice(masks)
+            if random_mask.ndim == 2:
+                random_mask = random_mask.unsqueeze(0)
             majority_mask = self.majority_vote(masks)
 
         image_meta_dict = {'filename_or_obj': name}
@@ -104,9 +98,7 @@ class SingleObjectDataset(Dataset):
         }
 
 
-# For compatibility with the rest of the code, we leave the LIDC_IDRI class unchanged.
-# (This class is used for a different dataset and is not affected by our modifications.)
-
+# The LIDC_IDRI class remains unchanged for compatibility.
 class LIDC_IDRI(Dataset):
     def __init__(self, dataset_location, transform=None, split_ratio=(0.8, 0.2)):
         self.transform = transform
@@ -118,6 +110,7 @@ class LIDC_IDRI(Dataset):
         self.train_indices, self.val_indices = self._split_dataset(len(self.data), split_ratio)
 
     def load_data(self, file_path):
+        import pickle
         max_bytes = 2 ** 31 - 1
         bytes_in = bytearray(0)
         input_size = os.path.getsize(file_path)
@@ -183,6 +176,7 @@ class LIDC_IDRI(Dataset):
         return len(self.data)
 
     def get_train_val_test(self):
+        from torch.utils.data import Subset
         train_dataset = Subset(self, self.train_indices)
         val_dataset = Subset(self, self.val_indices)
         return train_dataset, val_dataset
@@ -197,7 +191,7 @@ def build_dataset(args):
         transforms.ToTensor(),
     ])
     if args.dataset == 'refuge':
-        # Use the modified SingleObjectDataset (renamed here as REFUGE for compatibility)
+        # Use our modified SingleObjectDataset for the refuge dataset.
         train_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Training')
         val_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Validation')
         test_dataset = SingleObjectDataset(args.dataset_path, transform=transform_refuge, mode='Test')
